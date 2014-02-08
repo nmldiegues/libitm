@@ -91,7 +91,7 @@ htm_init ()
   // Maximum number of times we try to execute a transaction as a HW
   // transaction.
   // ??? Why 2?  Any offline or runtime tuning necessary?
-  return htm_available () ? 2 : 0;
+  return htm_available () ? 5 : 0;
 }
 
 static inline uint32_t

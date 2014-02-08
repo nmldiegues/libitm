@@ -23,6 +23,7 @@
    <http://www.gnu.org/licenses/>.  */
 
 #include "libitm_i.h"
+#include <x86intrin.h>
 #include <pthread.h>
 
 
@@ -147,7 +148,6 @@ choose_code_path(uint32_t prop, abi_dispatch *disp)
   else
     return a_runInstrumentedCode;
 }
-#include <stdio.h>
 uint32_t
 GTM::gtm_thread::begin_transaction (uint32_t prop, const gtm_jmpbuf *jb)
 {
@@ -188,43 +188,22 @@ GTM::gtm_thread::begin_transaction (uint32_t prop, const gtm_jmpbuf *jb)
   // and thus do not trigger the standard retry handling).
   if (likely(htm_fastpath && (prop & pr_hasNoAbort)))
     {
-printf("starting HW tx, tries: %d\n", htm_fastpath);
-      for (uint32_t t = htm_fastpath; t; t--)
-	{
+	  uint32_t t = htm_fastpath;
+	  while (t > 0) {
+		  if (unlikely(serial_lock.is_write_locked())) {
+			  while(serial_lock.is_write_locked()) {
+				  __asm__ ( "pause;" );
+			  }
+		  }
 	  uint32_t ret = htm_begin();
 	  if (htm_begin_success(ret))
 	    {
-	      // We are executing a transaction now.
-	      // Monitor the writer flag in the serial-mode lock, and abort
-	      // if there is an active or waiting serial-mode transaction.
-	      if (unlikely(serial_lock.is_write_locked()))
-		htm_abort();
-	      else
 		// We do not need to set a_saveLiveVariables because of HTM.
 		return (prop & pr_uninstrumentedCode) ?
 		    a_runUninstrumentedCode : a_runInstrumentedCode;
 	    }
-	  // The transaction has aborted.  Don't retry if it's unlikely that
-	  // retrying the transaction will be successful.
-	  if (!htm_abort_should_retry(ret))
-	    break;
-	  // Wait until any concurrent serial-mode transactions have finished.
-	  // This is an empty critical section, but won't be elided.
-	  if (serial_lock.is_write_locked())
-	    {
-	      tx = gtm_thr();
-	      if (unlikely(tx == NULL))
-	        {
-	          // See below.
-	          tx = new gtm_thread();
-	          set_gtm_thr(tx);
-	        }
-	      serial_lock.read_lock(tx);
-	      serial_lock.read_unlock(tx);
-	      // TODO We should probably reset the retry count t here, unless
-	      // we have retried so often that we should go serial to avoid
-	      // starvation.
-	    }
+      if (ret != _XABORT_CONFLICT && ret != _XABORT_RETRY) { t--; }
+      if (ret == _XABORT_CAPACITY && t < 5) { t = 0; }
 	}
     }
 #endif
