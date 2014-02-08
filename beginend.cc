@@ -25,7 +25,7 @@
 #include "libitm_i.h"
 #include <x86intrin.h>
 #include <pthread.h>
-
+#include <stdio.h>
 
 using namespace GTM;
 
@@ -39,6 +39,8 @@ unsigned GTM::gtm_thread::number_of_threads = 0;
 
 gtm_stmlock GTM::gtm_stmlock_array[LOCK_ARRAY_SIZE];
 atomic<gtm_version> GTM::gtm_clock;
+
+# define IS_LOCKED(lock)        *((volatile int*)(&lock)) != 0
 
 /* ??? Move elsewhere when we figure out library initialization.  */
 uint64_t GTM::gtm_spin_count_var = 1000;
@@ -54,6 +56,8 @@ static pthread_mutex_t global_tid_lock = PTHREAD_MUTEX_INITIALIZER;
 // Provides a on-thread-exit callback used to release per-thread data.
 static pthread_key_t thr_release_key;
 static pthread_once_t thr_release_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t global_lock = PTHREAD_MUTEX_INITIALIZER;
+__thread static bool usingLock = false;
 
 // See gtm_thread::begin_transaction.
 uint32_t GTM::htm_fastpath = 0;
@@ -190,10 +194,8 @@ GTM::gtm_thread::begin_transaction (uint32_t prop, const gtm_jmpbuf *jb)
     {
 	  uint32_t t = htm_fastpath;
 	  while (t > 0) {
-		  if (unlikely(serial_lock.is_write_locked())) {
-			  while(serial_lock.is_write_locked()) {
-				  __asm__ ( "pause;" );
-			  }
+		  if (unlikely(IS_LOCKED(global_lock))) {
+			  while (IS_LOCKED(global_lock)) { __asm__ ( "pause;" ); }
 		  }
 	  uint32_t ret = htm_begin();
 	  if (htm_begin_success(ret))
@@ -205,6 +207,10 @@ GTM::gtm_thread::begin_transaction (uint32_t prop, const gtm_jmpbuf *jb)
       if (ret != _XABORT_CONFLICT && ret != _XABORT_RETRY) { t--; }
       if (ret == _XABORT_CAPACITY && t < 5) { t = 0; }
 	}
+	  pthread_mutex_lock(&global_lock);
+	  usingLock = true;
+	  return (prop & pr_uninstrumentedCode) ?
+			  a_runUninstrumentedCode : a_runInstrumentedCode;
     }
 #endif
 
@@ -583,14 +589,16 @@ void ITM_REGPARM
 _ITM_commitTransaction(void)
 {
 #if defined(USE_HTM_FASTPATH)
-  // HTM fastpath.  If we are not executing a HW transaction, then we will be
-  // a serial-mode transaction.  If we are, then there will be no other
-  // concurrent serial-mode transaction.
-  // See gtm_thread::begin_transaction.
-  if (likely(htm_fastpath && !gtm_thread::serial_lock.is_write_locked()))
+	if (!usingLock)
     {
+		if (IS_LOCKED(global_lock)) {
+			htm_abort();
+		}
       htm_commit();
       return;
+    } else {
+    	pthread_mutex_unlock(&global_lock);
+    	return;
     }
 #endif
   gtm_thread *tx = gtm_thr();
@@ -606,6 +614,8 @@ _ITM_commitTransactionEH(void *exc_ptr)
   if (likely(htm_fastpath && !gtm_thread::serial_lock.is_write_locked()))
     {
       htm_commit();
+printf("commit transaction EH\n");
+exit(1);
       return;
     }
 #endif
