@@ -147,7 +147,7 @@ choose_code_path(uint32_t prop, abi_dispatch *disp)
   else
     return a_runInstrumentedCode;
 }
-
+#include <stdio.h>
 uint32_t
 GTM::gtm_thread::begin_transaction (uint32_t prop, const gtm_jmpbuf *jb)
 {
@@ -188,6 +188,7 @@ GTM::gtm_thread::begin_transaction (uint32_t prop, const gtm_jmpbuf *jb)
   // and thus do not trigger the standard retry handling).
   if (likely(htm_fastpath && (prop & pr_hasNoAbort)))
     {
+printf("starting HW tx, tries: %d\n", htm_fastpath);
       for (uint32_t t = htm_fastpath; t; t--)
 	{
 	  uint32_t ret = htm_begin();
