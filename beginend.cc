@@ -95,7 +95,6 @@ thread_exit_init()
     GTM_fatal("Creating thread release TLS key failed.");
 }
 
-
 GTM::gtm_thread::~gtm_thread()
 {
   if (nesting > 0)
