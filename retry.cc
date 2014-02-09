@@ -26,6 +26,8 @@
 #include <string.h>
 #include <ctype.h>
 #include "libitm_i.h"
+#include <stdio.h>
+#include <pthread.h>
 
 // The default TM method used when starting a new transaction.  Initialized
 // in number_of_threads_changed() below.
@@ -43,6 +45,7 @@ static GTM::abi_dispatch* default_dispatch_user = 0;
 void
 GTM::gtm_thread::decide_retry_strategy (gtm_restart_reason r)
 {
+// printf("%lu] decide retry strategy\n", pthread_self());
   struct abi_dispatch *disp = abi_disp ();
 
   this->restart_reason[r]++;
@@ -134,13 +137,14 @@ GTM::gtm_thread::decide_retry_strategy (gtm_restart_reason r)
     }
 }
 
-
+#include <stdio.h>
 // Decides which TM method should be used on the first attempt to run this
 // transaction.  Acquires the serial lock and sets transaction state
 // according to the chosen TM method.
 GTM::abi_dispatch*
 GTM::gtm_thread::decide_begin_dispatch (uint32_t prop)
 {
+// printf("%lu] decide begin dispatch\n", pthread_self());
   abi_dispatch* dd;
   // TODO Pay more attention to prop flags (eg, *omitted) when selecting
   // dispatch.

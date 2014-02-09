@@ -57,10 +57,11 @@ static pthread_mutex_t global_tid_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_key_t thr_release_key;
 static pthread_once_t thr_release_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t global_lock = PTHREAD_MUTEX_INITIALIZER;
-__thread static bool usingLock = false;
+static __thread bool usingLock = false;
+static __thread int inside_critical_section = 0;
 
 // See gtm_thread::begin_transaction.
-uint32_t GTM::htm_fastpath = 0;
+uint32_t GTM::htm_fastpath = 5;
 
 /* Allocate a transaction structure.  */
 void *
@@ -190,12 +191,15 @@ GTM::gtm_thread::begin_transaction (uint32_t prop, const gtm_jmpbuf *jb)
   // indeed in serial mode, and HW transactions should never need serial mode
   // for any internal changes (e.g., they never abort visibly to the STM code
   // and thus do not trigger the standard retry handling).
-  if (likely(htm_fastpath && (prop & pr_hasNoAbort)))
-    {
+/*  if (likely(htm_fastpath && (prop & pr_hasNoAbort)))
+    { */
+if (inside_critical_section == 0) {
+	inside_critical_section++;
+// printf("%lu] tx starting \n", pthread_self());
 	  uint32_t t = htm_fastpath;
 	  while (t > 0) {
 		  if (unlikely(IS_LOCKED(global_lock))) {
-			  while (IS_LOCKED(global_lock)) { __asm__ ( "pause;" ); }
+			  while (IS_LOCKED(global_lock)) { cpu_relax(); }
 		  }
 	  uint32_t ret = htm_begin();
 	  if (htm_begin_success(ret))
@@ -207,11 +211,17 @@ GTM::gtm_thread::begin_transaction (uint32_t prop, const gtm_jmpbuf *jb)
       if (ret != _XABORT_CONFLICT && ret != _XABORT_RETRY) { t--; }
       if (ret == _XABORT_CAPACITY && t < 5) { t = 0; }
 	}
+// printf("%lu] fallback triggered, uninstrumented? %d\n", pthread_self(), prop & pr_uninstrumentedCode);
 	  pthread_mutex_lock(&global_lock);
 	  usingLock = true;
 	  return (prop & pr_uninstrumentedCode) ?
 			  a_runUninstrumentedCode : a_runInstrumentedCode;
-    }
+//    }
+} else {
+	inside_critical_section++;
+	return (prop & pr_uninstrumentedCode) ?
+                          a_runUninstrumentedCode : a_runInstrumentedCode;
+}
 #endif
 
   tx = gtm_thr();
@@ -350,6 +360,7 @@ GTM::gtm_transaction_cp::save(gtm_thread* tx)
 void
 GTM::gtm_transaction_cp::commit(gtm_thread* tx)
 {
+// printf("%lu] commit tx\n", pthread_self());
   // Restore state that is not persistent across commits. Exception handling,
   // information, nesting level, and any logs do not need to be restored on
   // commits of nested transactions. Allocation actions must be committed
@@ -364,6 +375,7 @@ GTM::gtm_transaction_cp::commit(gtm_thread* tx)
 void
 GTM::gtm_thread::rollback (gtm_transaction_cp *cp, bool aborting)
 {
+// printf("%lu] rolling back\n", pthread_self());
   // The undo log is special in that it used for both thread-local and shared
   // data. Because of the latter, we have to roll it back before any
   // dispatch-specific rollback (which handles synchronization with other
@@ -423,6 +435,7 @@ GTM::gtm_thread::rollback (gtm_transaction_cp *cp, bool aborting)
 void ITM_REGPARM
 _ITM_abortTransaction (_ITM_abortReason reason)
 {
+// printf("%lu] abort transaction\n", pthread_self());
   gtm_thread *tx = gtm_thr();
 
   assert (reason == userAbort || reason == (userAbort | outerAbort));
@@ -474,6 +487,7 @@ _ITM_abortTransaction (_ITM_abortReason reason)
 bool
 GTM::gtm_thread::trycommit ()
 {
+// printf("%lu] try commit tx\n", pthread_self());
   nesting--;
 
   // Skip any real commit for elided transactions.
@@ -559,6 +573,7 @@ GTM::gtm_thread::trycommit ()
 void ITM_NORETURN
 GTM::gtm_thread::restart (gtm_restart_reason r, bool finish_serial_upgrade)
 {
+// printf("%lu] restart\n", pthread_self());
   // Roll back to outermost transaction. Do not reset transaction state because
   // we will continue executing this transaction.
   rollback ();
@@ -589,18 +604,30 @@ void ITM_REGPARM
 _ITM_commitTransaction(void)
 {
 #if defined(USE_HTM_FASTPATH)
+//if (likely(htm_fastpath)) {
+if (inside_critical_section == 1) {
 	if (!usingLock)
     {
 		if (IS_LOCKED(global_lock)) {
 			htm_abort();
 		}
       htm_commit();
+// printf("%lu] commit HW\n", pthread_self());
+inside_critical_section--;
       return;
     } else {
     	pthread_mutex_unlock(&global_lock);
+        usingLock = false;
+// printf("%lu] commit lock \n", pthread_self());
+inside_critical_section--;
     	return;
     }
+}
+inside_critical_section--;
+return;
+//}
 #endif
+// printf("%lu] commit bypassed htm\n", pthread_self());
   gtm_thread *tx = gtm_thr();
   if (!tx->trycommit ())
     tx->restart (RESTART_VALIDATE_COMMIT);
@@ -614,11 +641,12 @@ _ITM_commitTransactionEH(void *exc_ptr)
   if (likely(htm_fastpath && !gtm_thread::serial_lock.is_write_locked()))
     {
       htm_commit();
-printf("commit transaction EH\n");
+// printf("%lu] commit transaction EH\n", pthread_self());
 exit(1);
       return;
     }
 #endif
+// printf("%lu] commit EH bypassed\n", pthread_self());
   gtm_thread *tx = gtm_thr();
   if (!tx->trycommit ())
     {
