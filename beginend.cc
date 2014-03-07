@@ -42,6 +42,9 @@ unsigned GTM::gtm_thread::number_of_threads = 0;
 gtm_stmlock GTM::gtm_stmlock_array[LOCK_ARRAY_SIZE];
 atomic<gtm_version> GTM::gtm_clock;
 
+# define STUBBORN               0
+# define HALVEN                 1
+# define GIVEUP                 2
 
 #define N 624
 #define M 397
@@ -174,7 +177,8 @@ unsigned short retries;
 extern __thread memoized_choices_t* current_memoized;
 extern __thread memoized_choices_t* memoized_blocks;
 
-
+# define BLOCKS_SIZE	200
+# define HASH(i)		((unsigned long long)i)*2654435761 % BLOCKS_SIZE
 # define IS_LOCKED(lock)        *((volatile int*)(&lock)) != 0
 
 /* ??? Move elsewhere when we figure out library initialization.  */
@@ -283,6 +287,29 @@ GTM::gtm_thread::gtm_thread ()
 
   randomFallback = random_alloc();
   random_seed(randomFallback, time(NULL));
+
+  int sz = BLOCKS_SIZE;
+  memoized_blocks = (memoized_choices_t*) malloc(sz * sizeof(memoized_choices_t));
+  for (sz--; sz >= 0; sz-- ) {
+	  memoized_choices_t* block = &(memoized_blocks[sz]);
+	  block->runs = 0;
+	  block->havingCapacityAborts = 0;
+	  block->retries = 0;
+	  block->commitsHTM = 1;
+	  block->believedCapacity = 1;
+	  block->believedTransient = 1;
+	  block->believedGiveUp = 1;
+	  block->abortsCapacity = 0;
+	  block->abortsTransient = 0;
+	  block->cyclesCapacity = 100;
+	  block->cyclesTransient = 100;
+	  block->cyclesGiveUp = 100;
+	  block->retries = 5;
+	  block->lastCycles = 0;
+	  block->lastRetries = 5;
+	  block->bestEverCycles = 0;
+	  block->bestEverRetries = 5;
+  }
 }
 
 static inline uint32_t
@@ -342,26 +369,53 @@ GTM::gtm_thread::begin_transaction (uint32_t prop, const gtm_jmpbuf *jb)
 /*  if (likely(htm_fastpath && (prop & pr_hasNoAbort)))
     { */
     if (inside_critical_section == 0) {
-printf("%p\n", __builtin_return_address(1));
+    	int b = HASH(__builtin_return_address(1));
+    	current_memoized = &(memoized_blocks[b]);
+    	int tries = current_memoized->retries;
+    	int believedCapacityAborts = current_memoized->havingCapacityAborts;
+    	unsigned long long startTicks;
+    	int blockRuns = current_memoized->runs;
+    	int shouldProfile = blockRuns % 100 == 0;
+    	if (unlikely(shouldProfile)) {
+    		startTicks = tick();
+    	}
+    	current_memoized->runs++;
 
-        inside_critical_section++;
-    // printf("%lu] tx starting \n", pthread_self());
-          uint32_t t = htm_fastpath;
-          while (t > 0) {
-              if (unlikely(IS_LOCKED(global_lock))) {
-                  while (IS_LOCKED(global_lock)) { cpu_relax(); }
-              }
-          uint32_t ret = htm_begin();
-          if (htm_begin_success(ret))
-            {
-            // We do not need to set a_saveLiveVariables because of HTM.
-            return (prop & pr_uninstrumentedCode) ?
-                a_runUninstrumentedCode : a_runInstrumentedCode;
-            }
-          if (ret != _XABORT_CONFLICT && ret != _XABORT_RETRY) { t--; }
-          if (ret == _XABORT_CAPACITY && t < 5) { t = 0; }
-        }
-    // printf("%lu] fallback triggered, uninstrumented? %d\n", pthread_self(), prop & pr_uninstrumentedCode);
+    	inside_critical_section++;
+    	uint32_t t = tries;
+    	while (t > 0) {
+    		if (unlikely(IS_LOCKED(global_lock))) {
+    			while (IS_LOCKED(global_lock)) { cpu_relax(); }
+    		}
+    		uint32_t ret = htm_begin();
+    		if (htm_begin_success(ret))
+    		{
+    			// We do not need to set a_saveLiveVariables because of HTM.
+    			return (prop & pr_uninstrumentedCode) ?
+    					a_runUninstrumentedCode : a_runInstrumentedCode;
+    		}
+
+    		if (ret == _XABORT_CAPACITY) {
+    			current_memoized->abortsCapacity++;
+    			if (believedCapacityAborts == GIVEUP) { t = 1; }
+    			else if (believedCapacityAborts == HALVEN) { t = t / 2 + 1; }
+    		} else {
+    			current_memoized->abortsTransient++;
+    		}
+    		t--;
+    	}
+    	if (unlikely(shouldProfile)) {
+    		double totalAborts = current_memoized->abortsTransient + current_memoized->abortsCapacity;
+    		double percCapacity = current_memoized->abortsCapacity / totalAborts;
+    		double percTransient = 1 - percCapacity;
+    		int current_retries = current_memoized->retries;
+    		if (believedCapacityAborts && current_retries > 0) {
+    			current_memoized->retries = current_retries - (percCapacity * current_retries);
+    		}
+    		else if (believedCapacityAborts == 0 && current_retries < 16) {
+    			current_memoized->retries = current_retries + (percTransient * (16-current_retries));
+    		}
+    	}
           pthread_mutex_lock(&global_lock);
           usingLock = true;
           return (prop & pr_uninstrumentedCode) ?
@@ -753,28 +807,91 @@ void ITM_REGPARM
 _ITM_commitTransaction(void)
 {
 #if defined(USE_HTM_FASTPATH)
-//if (likely(htm_fastpath)) {
-if (inside_critical_section == 1) {
-	if (!usingLock)
-    {
-		if (IS_LOCKED(global_lock)) {
-			htm_abort();
+	if (inside_critical_section == 1) {
+		int b = HASH(__builtin_return_address(1));
+		if (!usingLock)
+		{
+			if (IS_LOCKED(global_lock)) {
+				htm_abort();
+			}
+			htm_commit();
+			inside_critical_section--;
+		} else {
+			pthread_mutex_unlock(&global_lock);
+			usingLock = false;
+			inside_critical_section--;
 		}
-      htm_commit();
-// printf("%lu] commit HW\n", pthread_self());
-inside_critical_section--;
-      return;
-    } else {
-    	pthread_mutex_unlock(&global_lock);
-        usingLock = false;
-// printf("%lu] commit lock \n", pthread_self());
-inside_critical_section--;
-    	return;
-    }
-}
-inside_critical_section--;
-return;
-//}
+
+		if (unlikely(shouldProfile)) {
+			unsigned long long finalTicks = tick() - startTicks;
+			double rewardCapacity, rewardOther, rewardGiveUp;
+			if (believedCapacityAborts == STUBBORN) {
+				current_memoized->cyclesTransient += finalTicks;
+			} else if (believedCapacityAborts == GIVEUP) {
+				current_memoized->cyclesGiveUp += finalTicks;
+			} else {
+				current_memoized->cyclesCapacity += finalTicks;
+			}
+			double logSum = 2*log((double)(current_memoized->believedCapacity + current_memoized->believedTransient));
+			double ucbCapacity, ucbOther, ucbGiveUp;
+			if (likely(random_generate(randomFallback) % 100 < 95)) {
+				double avgCapacityCycles = ((double)current_memoized->cyclesCapacity) / current_memoized->believedCapacity;
+				double avgTransientCycles = ((double)current_memoized->cyclesTransient) / current_memoized->believedTransient;
+				double avgGiveUpCycles = ((double)current_memoized->cyclesGiveUp) / current_memoized->believedGiveUp;
+				ucbCapacity = (100.0 / avgCapacityCycles) + sqrt(logSum / ((double)current_memoized->believedCapacity));
+				ucbOther = (100.0 / avgTransientCycles) + sqrt(logSum / ((double)current_memoized->believedTransient));
+				ucbOther = (100.0 / avgGiveUpCycles) + sqrt(logSum / ((double)current_memoized->believedGiveUp));
+			} else {
+				ucbCapacity = rewardCapacity;
+				ucbOther = rewardOther;
+				ucbGiveUp = rewardGiveUp;
+			}
+			if (ucbOther > ucbCapacity && ucbOther > ucbGiveUp) {
+				current_memoized->believedTransient++;
+				current_memoized->havingCapacityAborts = STUBBORN;
+			}
+			else if (ucbGiveUp > ucbOther && ucbGiveUp > ucbCapacity ) {
+				current_memoized->believedGiveUp++;
+				current_memoized->havingCapacityAborts = GIVEUP;
+			} else {
+				current_memoized->believedCapacity++;
+				current_memoized->havingCapacityAborts = HALVEN;
+			}
+			if (likely(current_memoized->lastCycles != 0)) {
+				double changeForBetter = (((double) finalTicks) / ((double) current_memoized->lastCycles));
+				double changeForWorse = (((double) current_memoized->lastCycles) / ((double) finalTicks));
+				unsigned short lastRetries = current_memoized->lastRetries;
+				unsigned short currentRetries = current_memoized->retries;
+				if (changeForBetter > 0.05 || changeForWorse > 0.05) {
+					if (changeForWorse > 0.40) {
+						current_memoized->retries = current_memoized->bestEverRetries;
+					}
+					else if (currentRetries - lastRetries > 0 && currentRetries < 16) {
+						current_memoized->retries = currentRetries + 1;
+						current_memoized->lastRetries = currentRetries;
+						current_memoized->lastCycles = finalTicks;
+					} else if (currentRetries - lastRetries < 0 && currentRetries > 0){
+						current_memoized->retries = currentRetries - 1;
+						current_memoized->lastRetries = currentRetries;
+						current_memoized->lastCycles = finalTicks;
+					}
+				}
+				if (finalTicks < current_memoized->bestEverCycles) {
+					current_memoized->bestEverCycles = finalTicks;
+					current_memoized->bestEverRetries = currentRetries;
+				}
+			} else {
+				current_memoized->lastCycles = finalTicks;
+				current_memoized->bestEverCycles = finalTicks;
+				current_memoized->lastRetries = current_memoized->retries;
+				current_memoized->bestEverRetries = current_memoized->retries;
+			}
+		}
+
+		return;
+	}
+	inside_critical_section--;
+	return;
 #endif
 // printf("%lu] commit bypassed htm\n", pthread_self());
   gtm_thread *tx = gtm_thr();
