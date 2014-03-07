@@ -29,6 +29,9 @@
 #include <random>
 #include <time.h>
 
+#define __HI(x) *(1+(int*)&x)
+#define __LO(x) *(int*)&x
+
 using namespace GTM;
 
 #if !defined(HAVE_ARCH_GTM_THREAD) || !defined(HAVE_ARCH_GTM_THREAD_DISP)
@@ -172,10 +175,12 @@ unsigned short retries;
     unsigned short lastRetries;
     unsigned long long bestEverCycles;
     unsigned short bestEverRetries;
+    unsigned long long startTicks;
 } memoized_choices_t;
 
-extern __thread memoized_choices_t* current_memoized;
-extern __thread memoized_choices_t* memoized_blocks;
+__thread bool inited;
+__thread memoized_choices_t* current_memoized;
+__thread memoized_choices_t* memoized_blocks;
 
 # define BLOCKS_SIZE	200
 # define HASH(i)		((unsigned long long)i)*2654435761 % BLOCKS_SIZE
@@ -285,31 +290,6 @@ GTM::gtm_thread::gtm_thread ()
   if (pthread_setspecific(thr_release_key, this))
     GTM_fatal("Setting thread release TLS key failed.");
 
-  randomFallback = random_alloc();
-  random_seed(randomFallback, time(NULL));
-
-  int sz = BLOCKS_SIZE;
-  memoized_blocks = (memoized_choices_t*) malloc(sz * sizeof(memoized_choices_t));
-  for (sz--; sz >= 0; sz-- ) {
-	  memoized_choices_t* block = &(memoized_blocks[sz]);
-	  block->runs = 0;
-	  block->havingCapacityAborts = 0;
-	  block->retries = 0;
-	  block->commitsHTM = 1;
-	  block->believedCapacity = 1;
-	  block->believedTransient = 1;
-	  block->believedGiveUp = 1;
-	  block->abortsCapacity = 0;
-	  block->abortsTransient = 0;
-	  block->cyclesCapacity = 100;
-	  block->cyclesTransient = 100;
-	  block->cyclesGiveUp = 100;
-	  block->retries = 5;
-	  block->lastCycles = 0;
-	  block->lastRetries = 5;
-	  block->bestEverCycles = 0;
-	  block->bestEverRetries = 5;
-  }
 }
 
 static inline uint32_t
@@ -319,6 +299,34 @@ choose_code_path(uint32_t prop, abi_dispatch *disp)
     return a_runUninstrumentedCode;
   else
     return a_runInstrumentedCode;
+}
+
+void initTuner() {
+  randomFallback = random_alloc();
+  random_seed(randomFallback, time(NULL));
+
+  int sz = BLOCKS_SIZE;
+  memoized_blocks = (memoized_choices_t*) malloc(sz * sizeof(memoized_choices_t));
+  for (sz--; sz >= 0; sz-- ) {
+          memoized_choices_t* block = &(memoized_blocks[sz]);
+          block->runs = 0;
+          block->havingCapacityAborts = 0;
+          block->retries = 0;
+          block->commitsHTM = 1;
+          block->believedCapacity = 1;
+          block->believedTransient = 1;
+          block->believedGiveUp = 1;
+          block->abortsCapacity = 0;
+          block->abortsTransient = 0;
+          block->cyclesCapacity = 100;
+          block->cyclesTransient = 100;
+          block->cyclesGiveUp = 100;
+          block->retries = 5;
+          block->lastCycles = 0;
+          block->lastRetries = 5;
+          block->bestEverCycles = 0;
+          block->bestEverRetries = 5;
+  }
 }
 
 __inline__ unsigned long long tick()
@@ -368,18 +376,19 @@ GTM::gtm_thread::begin_transaction (uint32_t prop, const gtm_jmpbuf *jb)
   // and thus do not trigger the standard retry handling).
 /*  if (likely(htm_fastpath && (prop & pr_hasNoAbort)))
     { */
-    if (inside_critical_section == 0) {
+    if (likely(inside_critical_section == 0)) {
+        if (unlikely(!inited)) {
+            initTuner(); inited = true;
+        }
     	int b = HASH(__builtin_return_address(1));
     	current_memoized = &(memoized_blocks[b]);
     	int tries = current_memoized->retries;
     	int believedCapacityAborts = current_memoized->havingCapacityAborts;
-    	unsigned long long startTicks;
     	int blockRuns = current_memoized->runs;
     	int shouldProfile = blockRuns % 100 == 0;
     	if (unlikely(shouldProfile)) {
-    		startTicks = tick();
+    		current_memoized->startTicks = tick();
     	}
-    	current_memoized->runs++;
 
     	inside_critical_section++;
     	uint32_t t = tries;
@@ -803,12 +812,72 @@ GTM::gtm_thread::restart (gtm_restart_reason r, bool finish_serial_upgrade)
 	       &jb, prop);
 }
 
+    double asmLog(double x) {
+	double hfsq,f,s,z,R,w,t1,t2,dk;
+	int k,hx,i,j;
+	unsigned lx;
+
+	hx = __HI(x);		/* high word of x */
+	lx = (unsigned int)x; // *((int*)&x); // __LO(x);		/* low  word of x */
+
+	k=0;
+	if (hx < 0x00100000) {			/* x < 2**-1022  */
+	    if (((hx&0x7fffffff)|lx)==0) 
+		return -1.80143985094819840000e+16/0.0;		/* log(+-0)=-inf */
+	    if (hx<0) return (x-x)/0.0;	/* log(-#) = NaN */
+	    k -= 54; x *= 1.80143985094819840000e+16; /* subnormal number, scale up x */
+	    hx = __HI(x);		/* high word of x */
+	} 
+	if (hx >= 0x7ff00000) return x+x;
+	k += (hx>>20)-1023;
+	hx &= 0x000fffff;
+	i = (hx+0x95f64)&0x100000;
+	__HI(x) = hx|(i^0x3ff00000);	/* normalize x or x/2 */
+	k += (i>>20);
+	f = x-1.0;
+	if((0x000fffff&(2+hx))<3) {	/* |f| < 2**-20 */
+	    if(f==0.0) { if(k==0) return 0.0; } else {dk=(double)k;
+				 return dk*6.93147180369123816490e-01+dk*1.90821492927058770002e-10;}
+	    R = f*f*(0.5-0.33333333333333333*f);
+	    if(k==0) return f-R; else {dk=(double)k;
+	    	     return dk*6.93147180369123816490e-01-((R-dk*1.90821492927058770002e-10)-f);}
+	}
+ 	s = f/(2.0+f); 
+	dk = (double)k;
+	z = s*s;
+	i = hx-0x6147a;
+	w = z*z;
+	j = 0x6b851-hx;
+	t1= w*(3.999999999940941908e-01+w*(2.222219843214978396e-01+w*1.531383769920937332e-01)); 
+	t2= z*(6.666666666666735130e-01+w*(2.857142874366239149e-01+w*(1.818357216161805012e-01+w*1.479819860511658591e-01))); 
+	i |= j;
+	R = t2+t1;
+	if(i>0) {
+	    hfsq=0.5*f*f;
+	    if(k==0) return f-(hfsq-s*(hfsq+R)); else
+		     return dk*6.93147180369123816490e-01-((hfsq-(s*(hfsq+R)+dk*1.90821492927058770002e-10))-f);
+	} else {
+	    if(k==0) return f-s*(f-R); else
+		     return dk*6.93147180369123816490e-01-((s*(f-R)-dk*1.90821492927058770002e-10)-f);
+	}
+}
+
+double asmSqrt(double x) {
+  __asm__ ("fsqrt" : "+t" (x));
+  return x;
+}
+
 void ITM_REGPARM
 _ITM_commitTransaction(void)
 {
 #if defined(USE_HTM_FASTPATH)
 	if (inside_critical_section == 1) {
 		int b = HASH(__builtin_return_address(1));
+                current_memoized = &(memoized_blocks[b]);
+                int believedCapacityAborts = current_memoized->havingCapacityAborts;
+                int blockRuns = current_memoized->runs;
+                int shouldProfile = blockRuns % 100 == 0;
+                current_memoized->runs++;
 		if (!usingLock)
 		{
 			if (IS_LOCKED(global_lock)) {
@@ -823,8 +892,8 @@ _ITM_commitTransaction(void)
 		}
 
 		if (unlikely(shouldProfile)) {
-			unsigned long long finalTicks = tick() - startTicks;
-			double rewardCapacity, rewardOther, rewardGiveUp;
+			unsigned long long finalTicks = tick() - current_memoized->startTicks;
+			double rewardCapacity = 0.0, rewardOther = 0.0, rewardGiveUp = 0.0;
 			if (believedCapacityAborts == STUBBORN) {
 				current_memoized->cyclesTransient += finalTicks;
 			} else if (believedCapacityAborts == GIVEUP) {
@@ -832,15 +901,15 @@ _ITM_commitTransaction(void)
 			} else {
 				current_memoized->cyclesCapacity += finalTicks;
 			}
-			double logSum = 2*log((double)(current_memoized->believedCapacity + current_memoized->believedTransient));
+			double logSum = 2*asmLog((double)(current_memoized->believedCapacity + current_memoized->believedTransient));
 			double ucbCapacity, ucbOther, ucbGiveUp;
 			if (likely(random_generate(randomFallback) % 100 < 95)) {
 				double avgCapacityCycles = ((double)current_memoized->cyclesCapacity) / current_memoized->believedCapacity;
 				double avgTransientCycles = ((double)current_memoized->cyclesTransient) / current_memoized->believedTransient;
 				double avgGiveUpCycles = ((double)current_memoized->cyclesGiveUp) / current_memoized->believedGiveUp;
-				ucbCapacity = (100.0 / avgCapacityCycles) + sqrt(logSum / ((double)current_memoized->believedCapacity));
-				ucbOther = (100.0 / avgTransientCycles) + sqrt(logSum / ((double)current_memoized->believedTransient));
-				ucbOther = (100.0 / avgGiveUpCycles) + sqrt(logSum / ((double)current_memoized->believedGiveUp));
+				ucbCapacity = (100.0 / avgCapacityCycles) + asmSqrt(logSum / ((double)current_memoized->believedCapacity));
+				ucbOther = (100.0 / avgTransientCycles) + asmSqrt(logSum / ((double)current_memoized->believedTransient));
+				ucbGiveUp = (100.0 / avgGiveUpCycles) + asmSqrt(logSum / ((double)current_memoized->believedGiveUp));
 			} else {
 				ucbCapacity = rewardCapacity;
 				ucbOther = rewardOther;
