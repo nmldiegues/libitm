@@ -26,6 +26,7 @@
 #include <x86intrin.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <random>
 
 using namespace GTM;
 
@@ -52,6 +53,9 @@ static _ITM_transactionId_t global_tid;
 static pthread_mutex_t global_tid_lock = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
+typedef std:::mt19937 rng_type;
+static __thread std::uniform_int_distribution<rng_type::result_type> udist(0, 100);
+static __thread rng_type rng;
 
 // Provides a on-thread-exit callback used to release per-thread data.
 static pthread_key_t thr_release_key;
@@ -62,6 +66,28 @@ static __thread int inside_critical_section = 0;
 
 // See gtm_thread::begin_transaction.
 uint32_t GTM::htm_fastpath = 5;
+
+typedef struct memoized_choices {
+unsigned long long runs;
+unsigned short havingCapacityAborts;
+unsigned short retries;
+    unsigned int commitsHTM;
+    unsigned long long cyclesCapacity;
+    unsigned long long cyclesTransient;
+    unsigned long long cyclesGiveUp;
+    unsigned long long abortsCapacity;
+    unsigned long long abortsTransient;
+    unsigned int believedCapacity;
+    unsigned int believedTransient;
+    unsigned int believedGiveUp;
+    unsigned long long lastCycles;
+    unsigned short lastRetries;
+    unsigned long long bestEverCycles;
+    unsigned short bestEverRetries;
+} memoized_choices_t;
+
+extern __thread memoized_choices_t* current_memoized;
+extern __thread memoized_choices_t* memoized_blocks;
 
 /* Allocate a transaction structure.  */
 void *
@@ -143,6 +169,9 @@ GTM::gtm_thread::gtm_thread ()
   // transaction when the current thread terminates.
   if (pthread_setspecific(thr_release_key, this))
     GTM_fatal("Setting thread release TLS key failed.");
+
+  rng_type::result_type const seedval = get_seed();
+  rng.seed(seedval);
 }
 
 static inline uint32_t
@@ -153,6 +182,14 @@ choose_code_path(uint32_t prop, abi_dispatch *disp)
   else
     return a_runInstrumentedCode;
 }
+
+__inline__ unsigned long long tick()
+{
+  unsigned hi, lo;
+  __asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));
+  return ( (unsigned long long)lo)|( ((unsigned long long)hi)<<32 );
+}
+
 uint32_t
 GTM::gtm_thread::begin_transaction (uint32_t prop, const gtm_jmpbuf *jb)
 {
@@ -193,35 +230,37 @@ GTM::gtm_thread::begin_transaction (uint32_t prop, const gtm_jmpbuf *jb)
   // and thus do not trigger the standard retry handling).
 /*  if (likely(htm_fastpath && (prop & pr_hasNoAbort)))
     { */
-if (inside_critical_section == 0) {
-	inside_critical_section++;
-// printf("%lu] tx starting \n", pthread_self());
-	  uint32_t t = htm_fastpath;
-	  while (t > 0) {
-		  if (unlikely(IS_LOCKED(global_lock))) {
-			  while (IS_LOCKED(global_lock)) { cpu_relax(); }
-		  }
-	  uint32_t ret = htm_begin();
-	  if (htm_begin_success(ret))
-	    {
-		// We do not need to set a_saveLiveVariables because of HTM.
-		return (prop & pr_uninstrumentedCode) ?
-		    a_runUninstrumentedCode : a_runInstrumentedCode;
-	    }
-      if (ret != _XABORT_CONFLICT && ret != _XABORT_RETRY) { t--; }
-      if (ret == _XABORT_CAPACITY && t < 5) { t = 0; }
-	}
-// printf("%lu] fallback triggered, uninstrumented? %d\n", pthread_self(), prop & pr_uninstrumentedCode);
-	  pthread_mutex_lock(&global_lock);
-	  usingLock = true;
-	  return (prop & pr_uninstrumentedCode) ?
-			  a_runUninstrumentedCode : a_runInstrumentedCode;
-//    }
-} else {
-	inside_critical_section++;
-	return (prop & pr_uninstrumentedCode) ?
-                          a_runUninstrumentedCode : a_runInstrumentedCode;
-}
+    if (inside_critical_section == 0) {
+printf("%p\n", __builtin_return_address(0));
+        // rng_type::result_type random_number = udist(rng);
+
+        inside_critical_section++;
+    // printf("%lu] tx starting \n", pthread_self());
+          uint32_t t = htm_fastpath;
+          while (t > 0) {
+              if (unlikely(IS_LOCKED(global_lock))) {
+                  while (IS_LOCKED(global_lock)) { cpu_relax(); }
+              }
+          uint32_t ret = htm_begin();
+          if (htm_begin_success(ret))
+            {
+            // We do not need to set a_saveLiveVariables because of HTM.
+            return (prop & pr_uninstrumentedCode) ?
+                a_runUninstrumentedCode : a_runInstrumentedCode;
+            }
+          if (ret != _XABORT_CONFLICT && ret != _XABORT_RETRY) { t--; }
+          if (ret == _XABORT_CAPACITY && t < 5) { t = 0; }
+        }
+    // printf("%lu] fallback triggered, uninstrumented? %d\n", pthread_self(), prop & pr_uninstrumentedCode);
+          pthread_mutex_lock(&global_lock);
+          usingLock = true;
+          return (prop & pr_uninstrumentedCode) ?
+                  a_runUninstrumentedCode : a_runInstrumentedCode;
+    } else {
+        inside_critical_section++;
+        return (prop & pr_uninstrumentedCode) ?
+                              a_runUninstrumentedCode : a_runInstrumentedCode;
+    }
 #endif
 
   tx = gtm_thr();
