@@ -342,7 +342,7 @@ GTM::gtm_thread::begin_transaction (uint32_t prop, const gtm_jmpbuf *jb)
 /*  if (likely(htm_fastpath && (prop & pr_hasNoAbort)))
     { */
     if (inside_critical_section == 0) {
-printf("%p\n", __builtin_return_address(0));
+printf("%p\n", __builtin_return_address(1));
 
         inside_critical_section++;
     // printf("%lu] tx starting \n", pthread_self());
