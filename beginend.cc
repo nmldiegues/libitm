@@ -27,6 +27,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <random>
+#include <time.h>
 
 using namespace GTM;
 
@@ -53,9 +54,9 @@ static _ITM_transactionId_t global_tid;
 static pthread_mutex_t global_tid_lock = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
-typedef std:::mt19937 rng_type;
-static __thread std::uniform_int_distribution<rng_type::result_type> udist(0, 100);
-static __thread rng_type rng;
+typedef std::mt19937 rng_type;
+static __thread std::uniform_int_distribution<rng_type::result_type> *udist;
+static __thread rng_type *rng;
 
 // Provides a on-thread-exit callback used to release per-thread data.
 static pthread_key_t thr_release_key;
@@ -170,8 +171,12 @@ GTM::gtm_thread::gtm_thread ()
   if (pthread_setspecific(thr_release_key, this))
     GTM_fatal("Setting thread release TLS key failed.");
 
-  rng_type::result_type const seedval = get_seed();
-  rng.seed(seedval);
+  //udist = (uniform_int_distribution<rng_type::result_type>*) malloc(sizeof(uniform_int_distribution<rng_type::result_type>));
+  //udist->a(0);
+  //udist->b(100);
+  udist = new std::uniform_int_distribution<rng_type::result_type>(0, 100);
+  rng = (rng_type*) malloc(sizeof(rng_type));
+  rng->seed(time(NULL));
 }
 
 static inline uint32_t
