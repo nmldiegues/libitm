@@ -147,17 +147,7 @@ random_t* random_alloc (void) {
 
     return randomPtr;
 }
-random_t* Prandom_alloc (void) {
-    random_t* randomPtr = (random_t*)P_MALLOC(sizeof(random_t));
-    if (randomPtr != NULL) {
-        randomPtr->mti = N;
-        init_genrand(randomPtr->mt, &(randomPtr->mti), RANDOM_DEFAULT_SEED);
-    }
-
-    return randomPtr;
-}
 void random_free (random_t* randomPtr) { free(randomPtr); }
-void Prandom_free (random_t* randomPtr) { P_FREE(randomPtr); }
 void random_seed (random_t* randomPtr, unsigned long seed) { init_genrand(randomPtr->mt, &(randomPtr->mti), seed); }
 unsigned long random_generate (random_t* randomPtr) { return genrand_int32(randomPtr->mt, &(randomPtr->mti)); }
 
