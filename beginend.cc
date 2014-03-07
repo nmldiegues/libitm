@@ -42,31 +42,125 @@ unsigned GTM::gtm_thread::number_of_threads = 0;
 gtm_stmlock GTM::gtm_stmlock_array[LOCK_ARRAY_SIZE];
 atomic<gtm_version> GTM::gtm_clock;
 
-# define IS_LOCKED(lock)        *((volatile int*)(&lock)) != 0
 
-/* ??? Move elsewhere when we figure out library initialization.  */
-uint64_t GTM::gtm_spin_count_var = 1000;
+#define N 624
+#define M 397
+#define MATRIX_A 0x9908b0dfUL   /* constant vector a */
+#define UPPER_MASK 0x80000000UL /* most significant w-r bits */
+#define LOWER_MASK 0x7fffffffUL /* least significant r bits */
 
-#ifdef HAVE_64BIT_SYNC_BUILTINS
-static atomic<_ITM_transactionId_t> global_tid;
-#else
-static _ITM_transactionId_t global_tid;
-static pthread_mutex_t global_tid_lock = PTHREAD_MUTEX_INITIALIZER;
-#endif
+#define RANDOM_DEFAULT_SEED (0)
 
-typedef std::mt19937 rng_type;
-static __thread std::uniform_int_distribution<rng_type::result_type> *udist;
-static __thread rng_type *rng;
+typedef struct random {
+    unsigned long (*rand)(unsigned long*, unsigned long*);
+    unsigned long mt[N];
+    unsigned long mti;
+} random_t;
 
-// Provides a on-thread-exit callback used to release per-thread data.
-static pthread_key_t thr_release_key;
-static pthread_once_t thr_release_once = PTHREAD_ONCE_INIT;
-static pthread_mutex_t global_lock = PTHREAD_MUTEX_INITIALIZER;
-static __thread bool usingLock = false;
-static __thread int inside_critical_section = 0;
+/* initializes mt[N] with a seed */
+void init_genrand(unsigned long mt[], unsigned long * mtiPtr, unsigned long s)
+{
+    unsigned long mti;
 
-// See gtm_thread::begin_transaction.
-uint32_t GTM::htm_fastpath = 5;
+    mt[0]= s & 0xffffffffUL;
+    for (mti=1; mti<N; mti++) {
+        mt[mti] =
+          (1812433253UL * (mt[mti-1] ^ (mt[mti-1] >> 30)) + mti);
+        /* See Knuth TAOCP Vol2. 3rd Ed. P.106 for multiplier. */
+        /* In the previous versions, MSBs of the seed affect   */
+        /* only MSBs of the array mt[].                        */
+        /* 2002/01/09 modified by Makoto Matsumoto             */
+        mt[mti] &= 0xffffffffUL;
+        /* for >32 bit machines */
+    }
+
+    (*mtiPtr) = mti;
+}
+
+void init_by_array(unsigned long mt[], unsigned long * mtiPtr, unsigned long init_key[], long key_length) {
+    long i, j, k;
+    init_genrand(mt, mtiPtr, 19650218UL);
+    i=1; j=0;
+    k = (N>key_length ? N : key_length);
+    for (; k; k--) {
+        mt[i] = (mt[i] ^ ((mt[i-1] ^ (mt[i-1] >> 30)) * 1664525UL))
+          + init_key[j] + j; /* non linear */
+        mt[i] &= 0xffffffffUL; /* for WORDSIZE > 32 machines */
+        i++; j++;
+        if (i>=N) { mt[0] = mt[N-1]; i=1; }
+        if (j>=key_length) j=0;
+    }
+    for (k=N-1; k; k--) {
+        mt[i] = (mt[i] ^ ((mt[i-1] ^ (mt[i-1] >> 30)) * 1566083941UL))
+          - i; /* non linear */
+        mt[i] &= 0xffffffffUL; /* for WORDSIZE > 32 machines */
+        i++;
+        if (i>=N) { mt[0] = mt[N-1]; i=1; }
+    }
+    mt[0] = 0x80000000UL; /* MSB is 1; assuring non-zero initial array */
+    (*mtiPtr) = N + 1;
+}
+
+unsigned long genrand_int32(unsigned long mt[], unsigned long * mtiPtr) {
+    unsigned long y;
+    static unsigned long mag01[2]={0x0UL, MATRIX_A};
+    unsigned long mti = (*mtiPtr);
+
+    if (mti >= N) { /* generate N words at one time */
+        long kk;
+        if (mti == N+1)   /* if init_genrand() has not been called, */
+            init_genrand(mt, mtiPtr, 5489UL); /* a default initial seed is used */
+        for (kk=0;kk<N-M;kk++) {
+            y = (mt[kk]&UPPER_MASK)|(mt[kk+1]&LOWER_MASK);
+            mt[kk] = mt[kk+M] ^ (y >> 1) ^ mag01[y & 0x1UL];
+        }
+        for (;kk<N-1;kk++) {
+            y = (mt[kk]&UPPER_MASK)|(mt[kk+1]&LOWER_MASK);
+            mt[kk] = mt[kk+(M-N)] ^ (y >> 1) ^ mag01[y & 0x1UL];
+        }
+        y = (mt[N-1]&UPPER_MASK)|(mt[0]&LOWER_MASK);
+        mt[N-1] = mt[M-1] ^ (y >> 1) ^ mag01[y & 0x1UL];
+        mti = 0;
+    }
+    y = mt[mti++];
+    y ^= (y >> 11);
+    y ^= (y << 7) & 0x9d2c5680UL;
+    y ^= (y << 15) & 0xefc60000UL;
+    y ^= (y >> 18);
+    (*mtiPtr) = mti;
+    return y;
+}
+long genrand_int31(unsigned long mt[], unsigned long * mtiPtr) { return (long)(genrand_int32(mt, mtiPtr)>>1); }
+double genrand_real1(unsigned long mt[], unsigned long * mtiPtr) { return genrand_int32(mt, mtiPtr)*(1.0/4294967295.0); }
+double genrand_real2(unsigned long mt[], unsigned long * mtiPtr) { return genrand_int32(mt, mtiPtr)*(1.0/4294967296.0); }
+double genrand_real3(unsigned long mt[], unsigned long * mtiPtr) { return (((double)genrand_int32(mt, mtiPtr)) + 0.5)*(1.0/4294967296.0); }
+double genrand_res53(unsigned long mt[], unsigned long * mtiPtr) {
+    unsigned long a=genrand_int32(mt, mtiPtr)>>5, b=genrand_int32(mt, mtiPtr)>>6;
+    return(a*67108864.0+b)*(1.0/9007199254740992.0);
+}
+random_t* random_alloc (void) {
+    random_t* randomPtr = (random_t*) malloc(sizeof(random_t));
+    if (randomPtr != NULL) {
+        randomPtr->mti = N;
+        init_genrand(randomPtr->mt, &(randomPtr->mti), RANDOM_DEFAULT_SEED);
+    }
+
+    return randomPtr;
+}
+random_t* Prandom_alloc (void) {
+    random_t* randomPtr = (random_t*)P_MALLOC(sizeof(random_t));
+    if (randomPtr != NULL) {
+        randomPtr->mti = N;
+        init_genrand(randomPtr->mt, &(randomPtr->mti), RANDOM_DEFAULT_SEED);
+    }
+
+    return randomPtr;
+}
+void random_free (random_t* randomPtr) { free(randomPtr); }
+void Prandom_free (random_t* randomPtr) { P_FREE(randomPtr); }
+void random_seed (random_t* randomPtr, unsigned long seed) { init_genrand(randomPtr->mt, &(randomPtr->mti), seed); }
+unsigned long random_generate (random_t* randomPtr) { return genrand_int32(randomPtr->mt, &(randomPtr->mti)); }
+
 
 typedef struct memoized_choices {
 unsigned long long runs;
@@ -89,6 +183,32 @@ unsigned short retries;
 
 extern __thread memoized_choices_t* current_memoized;
 extern __thread memoized_choices_t* memoized_blocks;
+
+
+# define IS_LOCKED(lock)        *((volatile int*)(&lock)) != 0
+
+/* ??? Move elsewhere when we figure out library initialization.  */
+uint64_t GTM::gtm_spin_count_var = 1000;
+
+#ifdef HAVE_64BIT_SYNC_BUILTINS
+static atomic<_ITM_transactionId_t> global_tid;
+#else
+static _ITM_transactionId_t global_tid;
+static pthread_mutex_t global_tid_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
+__thread random_t* randomFallback;
+
+// Provides a on-thread-exit callback used to release per-thread data.
+static pthread_key_t thr_release_key;
+static pthread_once_t thr_release_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t global_lock = PTHREAD_MUTEX_INITIALIZER;
+static __thread bool usingLock = false;
+static __thread int inside_critical_section = 0;
+
+// See gtm_thread::begin_transaction.
+uint32_t GTM::htm_fastpath = 5;
+
 
 /* Allocate a transaction structure.  */
 void *
@@ -171,12 +291,8 @@ GTM::gtm_thread::gtm_thread ()
   if (pthread_setspecific(thr_release_key, this))
     GTM_fatal("Setting thread release TLS key failed.");
 
-  //udist = (uniform_int_distribution<rng_type::result_type>*) malloc(sizeof(uniform_int_distribution<rng_type::result_type>));
-  //udist->a(0);
-  //udist->b(100);
-  udist = new std::uniform_int_distribution<rng_type::result_type>(0, 100);
-  rng = (rng_type*) malloc(sizeof(rng_type));
-  rng->seed(time(NULL));
+  randomFallback = random_alloc();
+  random_seed(randomFallback, time(NULL));
 }
 
 static inline uint32_t
@@ -237,7 +353,6 @@ GTM::gtm_thread::begin_transaction (uint32_t prop, const gtm_jmpbuf *jb)
     { */
     if (inside_critical_section == 0) {
 printf("%p\n", __builtin_return_address(0));
-        // rng_type::result_type random_number = udist(rng);
 
         inside_critical_section++;
     // printf("%lu] tx starting \n", pthread_self());
