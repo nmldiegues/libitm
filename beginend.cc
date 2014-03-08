@@ -902,14 +902,14 @@ _ITM_commitTransaction(void)
 				current_memoized->cyclesCapacity += finalTicks;
 			}
 			double logSum = 2*asmLog((double)(current_memoized->believedCapacity + current_memoized->believedTransient));
-			double ucbCapacity, ucbOther, ucbGiveUp;
+			double ucbCapacity = 0.0, ucbOther = 0.0, ucbGiveUp = 0.0;
 			if (likely(random_generate(randomFallback) % 100 < 95)) {
 				double avgCapacityCycles = ((double)current_memoized->cyclesCapacity) / current_memoized->believedCapacity;
 				double avgTransientCycles = ((double)current_memoized->cyclesTransient) / current_memoized->believedTransient;
 				double avgGiveUpCycles = ((double)current_memoized->cyclesGiveUp) / current_memoized->believedGiveUp;
 				ucbCapacity = (100.0 / avgCapacityCycles) + asmSqrt(logSum / ((double)current_memoized->believedCapacity));
 				ucbOther = (100.0 / avgTransientCycles) + asmSqrt(logSum / ((double)current_memoized->believedTransient));
-				ucbGiveUp = (100.0 / avgGiveUpCycles) + asmSqrt(logSum / ((double)current_memoized->believedGiveUp));
+				ucbOther = (100.0 / avgGiveUpCycles) + asmSqrt(logSum / ((double)current_memoized->believedGiveUp));
 			} else {
 				ucbCapacity = rewardCapacity;
 				ucbOther = rewardOther;
@@ -931,7 +931,7 @@ _ITM_commitTransaction(void)
 				double changeForWorse = (((double) current_memoized->lastCycles) / ((double) finalTicks));
 				unsigned short lastRetries = current_memoized->lastRetries;
 				unsigned short currentRetries = current_memoized->retries;
-				if (changeForBetter > 0.05 || changeForWorse > 0.05) {
+				if (changeForBetter > 0.15 || changeForWorse > 0.15) {
 					if (changeForWorse > 0.40) {
 						current_memoized->retries = current_memoized->bestEverRetries;
 					}
